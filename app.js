@@ -1,3 +1,6 @@
+import { DEFAULT_START_PROFILE, getInitialDisplayVideoConstraints, getProfileConfig } from "./applyProfile.js";
+import { VideoAdaptiveController } from "./videoAdaptiveController.js";
+
 class RealtimeApiClient {
   async request(path, init) {
     const response = await fetch(path, {
@@ -109,52 +112,6 @@ function syncMuteUi() {
 
 const IDLE_POLL_MS = 5000;
 const LIVE_POLL_MS = 60000;
-const HOST_STATS_POLL_MS = 5000;
-const PROFILE_CHANGE_COOLDOWN_MS = 15000;
-const VIDEO_PROFILES = {
-  "1080p-60": {
-    label: "1080p 60fps",
-    width: 1920,
-    height: 1080,
-    frameRate: 60,
-    maxBitrate: 8_000_000
-  },
-  "720p-60": {
-    label: "720p 60fps",
-    width: 1280,
-    height: 720,
-    frameRate: 60,
-    maxBitrate: 4_500_000
-  },
-  "540p-60": {
-    label: "540p 60fps",
-    width: 960,
-    height: 540,
-    frameRate: 60,
-    maxBitrate: 2_800_000
-  },
-  "1080p-30": {
-    label: "1080p 30fps",
-    width: 1920,
-    height: 1080,
-    frameRate: 30,
-    maxBitrate: 5_000_000
-  },
-  "720p-30": {
-    label: "720p 30fps",
-    width: 1280,
-    height: 720,
-    frameRate: 30,
-    maxBitrate: 2_500_000
-  }
-};
-const AUTO_FALLBACKS = {
-  "1080p-60": "720p-60",
-  "720p-60": "540p-60",
-  "540p-60": "720p-30",
-  "1080p-30": "720p-30",
-  "720p-30": null
-};
 
 const state = {
   role: "viewer",
@@ -162,10 +119,7 @@ const state = {
   hostSessionId: null,
   hostLocalStream: null,
   hostPublishedTracks: [],
-  hostStatsTimer: null,
-  hostSelectedProfileKey: null,
-  hostAppliedProfileKey: null,
-  hostLastProfileChangeAt: 0,
+  hostAdaptiveController: null,
   viewerPc: null,
   viewerRemoteStream: null,
   viewerSessionId: null,
@@ -222,101 +176,6 @@ function createRealtimePeerConnection() {
   });
 }
 
-function getSelectedVideoProfileKey() {
-  const resolution = els.resolutionSelect.value;
-  const fps = Number(els.fpsSelect.value);
-  if (resolution === "1080p" && fps >= 60) return "1080p-60";
-  if (resolution === "720p" && fps >= 60) return "720p-60";
-  if (resolution === "1080p") return "1080p-30";
-  return "720p-30";
-}
-
-function getVideoConstraintsForProfile(profileKey) {
-  const profile = VIDEO_PROFILES[profileKey] ?? VIDEO_PROFILES["720p-30"];
-  return {
-    width: { ideal: profile.width, max: profile.width },
-    height: { ideal: profile.height, max: profile.height },
-    frameRate: { ideal: profile.frameRate, max: profile.frameRate }
-  };
-}
-
-async function configureVideoSender(videoTrack, sender, profileKey) {
-  const profile = VIDEO_PROFILES[profileKey] ?? VIDEO_PROFILES["720p-30"];
-  await videoTrack.applyConstraints(getVideoConstraintsForProfile(profileKey));
-  videoTrack.contentHint = profile.frameRate >= 60 ? "motion" : "detail";
-
-  try {
-    const parameters = sender.getParameters();
-    const encoding = parameters.encodings?.[0] ?? {};
-    encoding.maxBitrate = profile.maxBitrate;
-    encoding.maxFramerate = profile.frameRate;
-    encoding.scaleResolutionDownBy = 1;
-    parameters.encodings = [encoding];
-    parameters.degradationPreference = "maintain-framerate";
-    await sender.setParameters(parameters);
-  } catch (error) {
-    console.warn("setParameters unsupported, falling back to track constraints only", error);
-  }
-
-  state.hostAppliedProfileKey = profileKey;
-  state.hostLastProfileChangeAt = Date.now();
-}
-
-function stopHostQualityMonitor() {
-  if (state.hostStatsTimer) {
-    window.clearInterval(state.hostStatsTimer);
-    state.hostStatsTimer = null;
-  }
-}
-
-function startHostQualityMonitor(videoTrack, sender) {
-  stopHostQualityMonitor();
-  state.hostStatsTimer = window.setInterval(async () => {
-    if (state.role !== "host" || !state.hostPc || sender.transport?.state === "closed") {
-      stopHostQualityMonitor();
-      return;
-    }
-
-    try {
-      const stats = await sender.getStats();
-      let outboundVideo = null;
-      stats.forEach((report) => {
-        if (report.type === "outbound-rtp" && report.kind === "video" && !report.isRemote) {
-          outboundVideo = report;
-        }
-      });
-      if (!outboundVideo) return;
-
-      const currentProfileKey = state.hostAppliedProfileKey;
-      const currentProfile = VIDEO_PROFILES[currentProfileKey];
-      if (!currentProfile) return;
-
-      const measuredFps = Number(outboundVideo.framesPerSecond ?? 0);
-      const limitationReason = outboundVideo.qualityLimitationReason ?? "none";
-      const targetFps = currentProfile.frameRate;
-      const hasLowFps = measuredFps > 0 && measuredFps < Math.max(45, targetFps * 0.85);
-      const fallbackProfileKey = AUTO_FALLBACKS[currentProfileKey];
-      const cooledDown = Date.now() - state.hostLastProfileChangeAt > PROFILE_CHANGE_COOLDOWN_MS;
-      const shouldDowngrade =
-        fallbackProfileKey &&
-        cooledDown &&
-        hasLowFps &&
-        ["bandwidth", "cpu", "other"].includes(limitationReason);
-
-      if (!shouldDowngrade) return;
-
-      await configureVideoSender(videoTrack, sender, fallbackProfileKey);
-      const fallbackProfile = VIDEO_PROFILES[fallbackProfileKey];
-      setStatus(
-        `检测到发送帧率偏低（约 ${Math.round(measuredFps)} fps），已自动切换到更稳的 ${fallbackProfile.label}。`,
-        "live"
-      );
-    } catch (error) {
-      console.warn("host quality monitor failed", error);
-    }
-  }, HOST_STATS_POLL_MS);
-}
-
 async function waitForConnected(pc, timeoutMs = 12000) {
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("Realtime 初始连接超时。")), timeoutMs);
@@ -347,10 +206,8 @@ async function cleanupHostState() {
   state.hostPc = null;
   state.hostSessionId = null;
   state.hostPublishedTracks = [];
-  state.hostSelectedProfileKey = null;
-  state.hostAppliedProfileKey = null;
-  state.hostLastProfileChangeAt = 0;
-  stopHostQualityMonitor();
+  state.hostAdaptiveController?.stop();
+  state.hostAdaptiveController = null;
   if (state.hostLocalStream) {
     state.hostLocalStream.getTracks().forEach((track) => track.stop());
     state.hostLocalStream = null;
@@ -395,8 +252,8 @@ async function startHostShare() {
   }
 
   const hostToken = els.hostToken.value.trim();
-  const selectedProfileKey = getSelectedVideoProfileKey();
-  const videoConstraints = getVideoConstraintsForProfile(selectedProfileKey);
+  // NON-INTRUSIVE PATCH: stable-first capture constraints for the adaptive controller.
+  const videoConstraints = getInitialDisplayVideoConstraints();
 
   try {
     await cleanupHostState();
@@ -405,7 +262,6 @@ async function startHostShare() {
       audio: els.audioToggle.checked
     });
     state.hostLocalStream = localStream;
-    state.hostSelectedProfileKey = selectedProfileKey;
     showVideo(localStream);
 
     const pc = createRealtimePeerConnection();
@@ -446,9 +302,6 @@ async function startHostShare() {
     await pc.setLocalDescription(await pc.createOffer());
     const publishResult = await api.tracksNew(state.hostSessionId, publishedTracks, pc.localDescription.sdp);
     await pc.setRemoteDescription(new RTCSessionDescription(publishResult.sessionDescription));
-    if (videoTrack && videoTransceiver?.sender) {
-      await configureVideoSender(videoTrack, videoTransceiver.sender, selectedProfileKey);
-    }
 
     state.hostPublishedTracks = publishedTracks;
     state.activeLive = {
@@ -463,13 +316,26 @@ async function startHostShare() {
 
     await api.startLive(state.activeLive, hostToken);
     if (videoTrack && videoTransceiver?.sender) {
-      startHostQualityMonitor(videoTrack, videoTransceiver.sender);
+      try {
+        // NON-INTRUSIVE PATCH: start adaptive control only after the existing publish flow succeeds.
+        const adaptiveController = new VideoAdaptiveController({
+          pc,
+          videoSender: videoTransceiver.sender,
+          videoTrack,
+          initialProfile: DEFAULT_START_PROFILE,
+          onUserMessage: (message) => setStatus(message, "live"),
+          onProfileChanged: ({ profileLabel }) => {
+            setStatus(`直播已启动，自适应推流当前档位 ${profileLabel}。`, "live");
+          }
+        });
+        state.hostAdaptiveController = adaptiveController;
+        await adaptiveController.start();
+      } catch (adaptiveError) {
+        console.warn("adaptive controller init failed", adaptiveError);
+      }
     }
     setButtons(true);
-    setStatus(
-      `直播已启动，当前发送档位 ${VIDEO_PROFILES[state.hostAppliedProfileKey ?? selectedProfileKey].label}。`,
-      "live"
-    );
+    setStatus(`直播已启动，当前自适应初始档位 ${getProfileConfig(DEFAULT_START_PROFILE).label}。`, "live");
   } catch (error) {
     console.error(error);
     setStatus(`启动失败：${error instanceof Error ? error.message : "Unknown error"}`, "error");
