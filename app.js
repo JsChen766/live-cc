@@ -98,6 +98,14 @@ const player = new Plyr(els.mainVideo, {
   controls: ["play", "progress", "current-time", "mute", "volume", "settings", "fullscreen"],
   fullscreen: { enabled: true, fallback: true, iosNative: true }
 });
+player.muted = true;
+player.volume = 0;
+
+function syncMuteUi() {
+  const muted = Boolean(player.muted);
+  els.mainVideo.muted = muted;
+  els.muteBtn.textContent = muted ? "取消静音" : "静音";
+}
 
 const IDLE_POLL_MS = 5000;
 const LIVE_POLL_MS = 60000;
@@ -543,10 +551,8 @@ async function startViewerPlayback(liveState) {
       await api.renegotiate(state.viewerSessionId, pc.localDescription.sdp);
     }
 
-    els.mainVideo.muted = false;
-    els.mainVideo.volume = Number(els.volumeRange.value) / 100;
-    player.muted = false;
     player.volume = Number(els.volumeRange.value) / 100;
+    syncMuteUi();
     setStatus("正在观看直播。", "live");
     useLivePolling();
   } catch (error) {
@@ -596,14 +602,20 @@ els.startBtn.addEventListener("click", () => void startHostShare());
 els.stopBtn.addEventListener("click", () => void stopLive());
 els.muteBtn.addEventListener("click", () => {
   player.muted = !player.muted;
-  els.mainVideo.muted = player.muted;
-  els.muteBtn.textContent = player.muted ? "取消静音" : "静音";
+  if (player.muted) {
+    player.volume = 0;
+  } else if (player.volume === 0) {
+    player.volume = Number(els.volumeRange.value) / 100;
+  }
+  syncMuteUi();
 });
 els.fullscreenBtn.addEventListener("click", () => player.fullscreen.enter());
 els.volumeRange.addEventListener("input", () => {
   const nextVolume = Number(els.volumeRange.value) / 100;
   player.volume = nextVolume;
   els.mainVideo.volume = nextVolume;
+  player.muted = nextVolume === 0;
+  syncMuteUi();
 });
 els.qualitySelect.addEventListener("change", () => {
   setStatus(`播放器清晰度标记已切换到 ${els.qualitySelect.value}。`, state.activeLive ? "live" : "idle");
@@ -617,6 +629,7 @@ window.addEventListener("beforeunload", () => {
 
 setButtons(false);
 showEmpty("当前未开播", "主播开始投屏后，这个页面会自动播放直播。");
+syncMuteUi();
 setStatus("页面加载完成，正在检查当前直播状态。", "loading");
 startPolling();
 void refreshLiveState();
