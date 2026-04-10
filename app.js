@@ -111,6 +111,20 @@ const VIDEO_PROFILES = {
     frameRate: 60,
     maxBitrate: 8_000_000
   },
+  "720p-60": {
+    label: "720p 60fps",
+    width: 1280,
+    height: 720,
+    frameRate: 60,
+    maxBitrate: 4_500_000
+  },
+  "540p-60": {
+    label: "540p 60fps",
+    width: 960,
+    height: 540,
+    frameRate: 60,
+    maxBitrate: 2_800_000
+  },
   "1080p-30": {
     label: "1080p 30fps",
     width: 1920,
@@ -127,7 +141,9 @@ const VIDEO_PROFILES = {
   }
 };
 const AUTO_FALLBACKS = {
-  "1080p-60": "1080p-30",
+  "1080p-60": "720p-60",
+  "720p-60": "540p-60",
+  "540p-60": "720p-30",
   "1080p-30": "720p-30",
   "720p-30": null
 };
@@ -202,6 +218,7 @@ function getSelectedVideoProfileKey() {
   const resolution = els.resolutionSelect.value;
   const fps = Number(els.fpsSelect.value);
   if (resolution === "1080p" && fps >= 60) return "1080p-60";
+  if (resolution === "720p" && fps >= 60) return "720p-60";
   if (resolution === "1080p") return "1080p-30";
   return "720p-30";
 }
@@ -218,15 +235,16 @@ function getVideoConstraintsForProfile(profileKey) {
 async function configureVideoSender(videoTrack, sender, profileKey) {
   const profile = VIDEO_PROFILES[profileKey] ?? VIDEO_PROFILES["720p-30"];
   await videoTrack.applyConstraints(getVideoConstraintsForProfile(profileKey));
-  videoTrack.contentHint = "detail";
+  videoTrack.contentHint = profile.frameRate >= 60 ? "motion" : "detail";
 
   try {
     const parameters = sender.getParameters();
     const encoding = parameters.encodings?.[0] ?? {};
     encoding.maxBitrate = profile.maxBitrate;
     encoding.maxFramerate = profile.frameRate;
+    encoding.scaleResolutionDownBy = 1;
     parameters.encodings = [encoding];
-    parameters.degradationPreference = "balanced";
+    parameters.degradationPreference = "maintain-framerate";
     await sender.setParameters(parameters);
   } catch (error) {
     console.warn("setParameters unsupported, falling back to track constraints only", error);
@@ -267,7 +285,8 @@ function startHostQualityMonitor(videoTrack, sender) {
 
       const measuredFps = Number(outboundVideo.framesPerSecond ?? 0);
       const limitationReason = outboundVideo.qualityLimitationReason ?? "none";
-      const hasLowFps = measuredFps > 0 && measuredFps < Math.max(12, currentProfile.frameRate * 0.6);
+      const targetFps = currentProfile.frameRate;
+      const hasLowFps = measuredFps > 0 && measuredFps < Math.max(45, targetFps * 0.85);
       const fallbackProfileKey = AUTO_FALLBACKS[currentProfileKey];
       const cooledDown = Date.now() - state.hostLastProfileChangeAt > PROFILE_CHANGE_COOLDOWN_MS;
       const shouldDowngrade =
