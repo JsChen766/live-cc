@@ -86,17 +86,12 @@ const els = {
   fullscreenBtn: document.getElementById("fullscreen-btn"),
   statusText: document.getElementById("status-text"),
   statusPill: document.getElementById("status-pill"),
-  networkChip: document.getElementById("network-chip"),
   hostToken: document.getElementById("host-token"),
   resolutionSelect: document.getElementById("resolution-select"),
   fpsSelect: document.getElementById("fps-select"),
   audioToggle: document.getElementById("audio-toggle"),
   volumeRange: document.getElementById("volume-range"),
-  qualitySelect: document.getElementById("quality-select"),
-  metricConnection: document.getElementById("metric-connection"),
-  metricAudio: document.getElementById("metric-audio"),
-  metricQuality: document.getElementById("metric-quality"),
-  metricRole: document.getElementById("metric-role")
+  qualitySelect: document.getElementById("quality-select")
 };
 
 const player = new Plyr(els.mainVideo, {
@@ -136,12 +131,6 @@ function showEmpty(title, copy) {
   els.emptyState.style.display = "flex";
 }
 
-function updateMetrics() {
-  els.metricRole.textContent = state.role === "host" ? "主播" : "观众";
-  els.metricAudio.textContent = els.audioToggle.checked ? "系统音频" : "关闭";
-  els.metricQuality.textContent = `${els.resolutionSelect.value} / ${els.fpsSelect.value}fps`;
-}
-
 function setButtons(hosting) {
   els.startBtn.disabled = hosting;
   els.stopBtn.disabled = !hosting;
@@ -158,8 +147,6 @@ async function waitForConnected(pc, timeoutMs = 12000) {
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("Realtime 初始连接超时。")), timeoutMs);
     const onState = () => {
-      els.metricConnection.textContent = `${pc.connectionState} / ${pc.iceConnectionState}`;
-      els.networkChip.textContent = `${pc.connectionState} / ${pc.iceConnectionState}`;
       if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
         clearTimeout(timer);
         resolve();
@@ -213,14 +200,12 @@ async function stopLive() {
   await cleanupHostState();
   state.activeLive = null;
   setButtons(false);
-  updateMetrics();
-  showEmpty("当前未开播", "主播点击右侧“开始投屏”后，观众访问本页会自动看到直播。");
+  showEmpty("当前未开播", "主播开始投屏后，这个页面会自动播放直播。");
   setStatus("直播已停止。", "idle");
 }
 
 async function startHostShare() {
   state.role = "host";
-  updateMetrics();
   setStatus("正在请求屏幕共享...", "loading");
   cleanupViewerState();
 
@@ -292,12 +277,11 @@ async function startHostShare() {
     await api.startLive(state.activeLive, hostToken);
     setButtons(true);
     setStatus("直播已启动，其他访客访问同一页面会自动看到。", "live");
-    els.networkChip.textContent = "Host Live";
   } catch (error) {
     console.error(error);
     setStatus(`启动失败：${error instanceof Error ? error.message : "Unknown error"}`, "error");
     await cleanupHostState();
-    showEmpty("当前未开播", "主播点击右侧“开始投屏”后，观众访问本页会自动看到直播。");
+    showEmpty("当前未开播", "主播开始投屏后，这个页面会自动播放直播。");
   }
 }
 
@@ -307,7 +291,6 @@ async function startViewerPlayback(liveState) {
 
   cleanupViewerState();
   state.role = "viewer";
-  updateMetrics();
   setStatus("检测到直播，正在连接观看流...", "loading");
 
   try {
@@ -357,7 +340,6 @@ async function startViewerPlayback(liveState) {
     player.muted = false;
     player.volume = Number(els.volumeRange.value) / 100;
     setStatus("正在观看直播。", "live");
-    els.networkChip.textContent = "Viewer Live";
   } catch (error) {
     console.error(error);
     cleanupViewerState();
@@ -376,7 +358,7 @@ async function refreshLiveState() {
       }
     } else if (state.role !== "host") {
       cleanupViewerState();
-      showEmpty("当前未开播", "主播点击右侧“开始投屏”后，观众访问本页会自动看到直播。");
+      showEmpty("当前未开播", "主播开始投屏后，这个页面会自动播放直播。");
       setStatus("当前未检测到直播。", "idle");
     }
   } catch (error) {
@@ -406,9 +388,6 @@ els.volumeRange.addEventListener("input", () => {
   player.volume = nextVolume;
   els.mainVideo.volume = nextVolume;
 });
-els.audioToggle.addEventListener("change", updateMetrics);
-els.resolutionSelect.addEventListener("change", updateMetrics);
-els.fpsSelect.addEventListener("change", updateMetrics);
 els.qualitySelect.addEventListener("change", () => {
   setStatus(`播放器清晰度标记已切换到 ${els.qualitySelect.value}。`, state.activeLive ? "live" : "idle");
 });
@@ -419,9 +398,8 @@ window.addEventListener("beforeunload", () => {
   }
 });
 
-updateMetrics();
 setButtons(false);
-showEmpty("当前未开播", "主播点击右侧“开始投屏”后，观众访问本页会自动看到直播。");
+showEmpty("当前未开播", "主播开始投屏后，这个页面会自动播放直播。");
 setStatus("页面加载完成，正在检查当前直播状态。", "loading");
 startPolling();
 void refreshLiveState();

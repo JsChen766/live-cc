@@ -14,69 +14,43 @@
     <title>LiveCC Single Room</title>
   </head>
   <body>
-    <div class="shell">
-      <header class="topbar">
-        <div>
-          <div class="eyebrow">LiveCC Single Room</div>
-          <h1>单房间直播页</h1>
-          <p>同一个 Pages 地址，主播点击投屏后，观众访问同一页面即可自动观看当前直播。</p>
+    <main class="app-shell">
+      <section class="player-card">
+        <div class="player-topbar">
+          <div class="brand">LiveCC</div>
+          <div class="status-pill idle" id="status-pill">待机中</div>
         </div>
-        <div class="status-pill idle" id="status-pill">待机中</div>
-      </header>
 
-      <main class="layout">
-        <section class="stage">
-          <div class="stage-head">
-            <div>
-              <span class="room-label">Alpha Room</span>
-              <h2>固定直播间</h2>
-            </div>
-            <div class="network-chip" id="network-chip">Idle</div>
+        <div class="video-shell">
+          <video id="main-video" autoplay playsinline></video>
+          <div class="empty-state" id="empty-state">
+            <h1 id="empty-title">当前未开播</h1>
+            <p id="empty-copy">主播开始投屏后，这个页面会自动播放直播。</p>
           </div>
+        </div>
 
-          <div class="video-shell">
-            <video id="main-video" autoplay playsinline></video>
-            <div class="empty-state" id="empty-state">
-              <div class="empty-icon">LIVE</div>
-              <h3 id="empty-title">当前未开播</h3>
-              <p id="empty-copy">主播点击右侧“开始投屏”后，观众访问本页会自动看到直播。</p>
-            </div>
-          </div>
-
-          <div class="metrics">
-            <div class="metric-card">
-              <span>连接状态</span>
-              <strong id="metric-connection">Idle</strong>
-            </div>
-            <div class="metric-card">
-              <span>音频状态</span>
-              <strong id="metric-audio">关闭</strong>
-            </div>
-            <div class="metric-card">
-              <span>画质</span>
-              <strong id="metric-quality">1080p / 60fps</strong>
-            </div>
-            <div class="metric-card">
-              <span>当前角色</span>
-              <strong id="metric-role">观众</strong>
-            </div>
-          </div>
-        </section>
-
-        <aside class="sidebar">
-          <section class="panel">
-            <div class="panel-title">直播控制</div>
+        <div class="control-bar">
+          <div class="primary-actions">
             <button id="start-btn" class="primary-btn">开始投屏</button>
-            <button id="stop-btn" class="secondary-btn" disabled>停止投屏</button>
-            <div class="status-box" id="status-text">页面加载完成，正在检查当前直播状态。</div>
-          </section>
+            <button id="stop-btn" class="secondary-btn" disabled>停止</button>
+          </div>
 
-          <section class="panel">
-            <div class="panel-title">主播设置</div>
+          <div class="secondary-actions">
+            <button id="mute-btn" class="ghost-btn">静音</button>
+            <button id="fullscreen-btn" class="ghost-btn">全屏</button>
+          </div>
+        </div>
+
+        <div class="status-line" id="status-text">页面加载完成，正在检查当前直播状态。</div>
+
+        <details class="advanced-panel">
+          <summary>高级设置</summary>
+          <div class="advanced-grid">
             <label class="field">
               <span>管理密钥</span>
-              <input id="host-token" type="password" placeholder="如果配置了 HOST_TOKEN，在这里输入" />
+              <input id="host-token" type="password" placeholder="如已配置 HOST_TOKEN，在此输入" />
             </label>
+
             <label class="field">
               <span>分辨率</span>
               <select id="resolution-select">
@@ -84,6 +58,7 @@
                 <option value="720p">720p</option>
               </select>
             </label>
+
             <label class="field">
               <span>帧率</span>
               <select id="fps-select">
@@ -91,25 +66,17 @@
                 <option value="30">30 fps</option>
               </select>
             </label>
-            <label class="toggle-row">
-              <div>
-                <strong>系统音频</strong>
-                <small>把桌面或标签页声音混入直播流</small>
-              </div>
-              <input id="audio-toggle" type="checkbox" checked />
-            </label>
-          </section>
 
-          <section class="panel">
-            <div class="panel-title">播放器控制</div>
             <label class="field">
               <span>音量</span>
               <input id="volume-range" type="range" min="0" max="100" value="80" />
             </label>
-            <div class="button-row">
-              <button id="mute-btn" class="ghost-btn">静音</button>
-              <button id="fullscreen-btn" class="ghost-btn">全屏</button>
-            </div>
+
+            <label class="toggle-row">
+              <span>系统音频</span>
+              <input id="audio-toggle" type="checkbox" checked />
+            </label>
+
             <label class="field">
               <span>清晰度标记</span>
               <select id="quality-select">
@@ -118,12 +85,12 @@
                 <option value="720p">720p</option>
               </select>
             </label>
-          </section>
-        </aside>
-      </main>
-    </div>
+          </div>
+        </details>
+      </section>
+    </main>
 
     <script src="https://cdn.plyr.io/3.7.8/plyr.polyfilled.js"></script>
     <script type="module" src="./app.js"></script>
   </body>
-  </html>
+</html>
