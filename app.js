@@ -410,9 +410,6 @@ async function startHostShare() {
     );
     const videoTrack = localStream.getVideoTracks()[0] ?? null;
     const videoTransceiver = transceivers.find((transceiver) => transceiver.sender.track?.kind === "video") ?? null;
-    if (videoTrack && videoTransceiver?.sender) {
-      await configureVideoSender(videoTrack, videoTransceiver.sender, selectedProfileKey);
-    }
 
     setStatus("正在创建 Realtime Session...", "loading");
     await pc.setLocalDescription(await pc.createOffer());
@@ -441,6 +438,9 @@ async function startHostShare() {
     await pc.setLocalDescription(await pc.createOffer());
     const publishResult = await api.tracksNew(state.hostSessionId, publishedTracks, pc.localDescription.sdp);
     await pc.setRemoteDescription(new RTCSessionDescription(publishResult.sessionDescription));
+    if (videoTrack && videoTransceiver?.sender) {
+      await configureVideoSender(videoTrack, videoTransceiver.sender, selectedProfileKey);
+    }
 
     state.hostPublishedTracks = publishedTracks;
     state.activeLive = {
