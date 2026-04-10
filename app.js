@@ -99,6 +99,9 @@ const player = new Plyr(els.mainVideo, {
   fullscreen: { enabled: true, fallback: true, iosNative: true }
 });
 
+const IDLE_POLL_MS = 5000;
+const LIVE_POLL_MS = 60000;
+
 const state = {
   role: "viewer",
   hostPc: null,
@@ -108,8 +111,12 @@ const state = {
   viewerPc: null,
   viewerRemoteStream: null,
   viewerSessionId: null,
+  viewerLiveSessionId: null,
+  viewerConnectingLiveSessionId: null,
   activeLive: null,
-  pollTimer: null
+  pollTimer: null,
+  pollIntervalMs: IDLE_POLL_MS,
+  refreshInFlight: false
 };
 
 function setStatus(message, tone = "idle") {
@@ -134,6 +141,20 @@ function showEmpty(title, copy) {
 function setButtons(hosting) {
   els.startBtn.disabled = hosting;
   els.stopBtn.disabled = !hosting;
+}
+
+function setPollingInterval(intervalMs) {
+  if (state.pollIntervalMs === intervalMs && state.pollTimer) return;
+  state.pollIntervalMs = intervalMs;
+  startPolling();
+}
+
+function resumeIdlePolling() {
+  setPollingInterval(IDLE_POLL_MS);
+}
+
+function useLivePolling() {
+  setPollingInterval(LIVE_POLL_MS);
 }
 
 function createRealtimePeerConnection() {
@@ -183,6 +204,8 @@ function cleanupViewerState() {
   state.viewerPc?.close();
   state.viewerPc = null;
   state.viewerSessionId = null;
+  state.viewerLiveSessionId = null;
+  state.viewerConnectingLiveSessionId = null;
   if (state.viewerRemoteStream) {
     state.viewerRemoteStream.getTracks().forEach((track) => track.stop());
     state.viewerRemoteStream = null;
@@ -202,12 +225,17 @@ async function stopLive() {
   setButtons(false);
   showEmpty("当前未开播", "主播开始投屏后，这个页面会自动播放直播。");
   setStatus("直播已停止。", "idle");
+  resumeIdlePolling();
 }
 
 async function startHostShare() {
   state.role = "host";
   setStatus("正在请求屏幕共享...", "loading");
   cleanupViewerState();
+  if (state.pollTimer) {
+    window.clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
 
   const hostToken = els.hostToken.value.trim();
   const resolution = els.resolutionSelect.value;
@@ -287,9 +315,11 @@ async function startHostShare() {
 
 async function startViewerPlayback(liveState) {
   if (!liveState) return;
-  if (state.viewerPc && state.viewerSessionId === liveState.sessionId) return;
+  if (state.viewerLiveSessionId === liveState.sessionId && state.viewerPc) return;
+  if (state.viewerConnectingLiveSessionId === liveState.sessionId) return;
 
   cleanupViewerState();
+  state.viewerConnectingLiveSessionId = liveState.sessionId;
   state.role = "viewer";
   setStatus("检测到直播，正在连接观看流...", "loading");
 
@@ -298,11 +328,29 @@ async function startViewerPlayback(liveState) {
     state.viewerPc = pc;
     const remoteStream = new MediaStream();
     state.viewerRemoteStream = remoteStream;
+    let recovering = false;
+
+    const recoverViewerPlayback = () => {
+      if (recovering) return;
+      recovering = true;
+      if (state.role !== "viewer") return;
+      cleanupViewerState();
+      showEmpty("直播已断开", "正在重新检查直播状态。");
+      setStatus("播放连接已断开，正在重新检查直播状态。", "loading");
+      resumeIdlePolling();
+      void refreshLiveState();
+    };
 
     const hasVideo = liveState.tracks.some((track) => track.kind === "video");
     const hasAudio = liveState.tracks.some((track) => track.kind === "audio");
     if (hasVideo) pc.addTransceiver("video", { direction: "recvonly" });
     if (hasAudio) pc.addTransceiver("audio", { direction: "recvonly" });
+
+    pc.addEventListener("connectionstatechange", () => {
+      if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+        recoverViewerPlayback();
+      }
+    });
 
     pc.ontrack = (event) => {
       if (event.streams[0]) {
@@ -310,9 +358,11 @@ async function startViewerPlayback(liveState) {
           if (!remoteStream.getTracks().some((existing) => existing.id === track.id)) {
             remoteStream.addTrack(track);
           }
+          track.addEventListener("ended", recoverViewerPlayback, { once: true });
         });
       } else if (!remoteStream.getTracks().some((existing) => existing.id === event.track.id)) {
         remoteStream.addTrack(event.track);
+        event.track.addEventListener("ended", recoverViewerPlayback, { once: true });
       }
       showVideo(remoteStream);
     };
@@ -320,6 +370,7 @@ async function startViewerPlayback(liveState) {
     await pc.setLocalDescription(await pc.createOffer());
     const sessionResult = await api.sessionNew(pc.localDescription.sdp);
     state.viewerSessionId = sessionResult.sessionId;
+    state.viewerLiveSessionId = liveState.sessionId;
     await pc.setRemoteDescription(new RTCSessionDescription(sessionResult.sessionDescription));
     await waitForConnected(pc);
 
@@ -340,15 +391,21 @@ async function startViewerPlayback(liveState) {
     player.muted = false;
     player.volume = Number(els.volumeRange.value) / 100;
     setStatus("正在观看直播。", "live");
+    useLivePolling();
   } catch (error) {
     console.error(error);
     cleanupViewerState();
     setStatus(`观看失败：${error instanceof Error ? error.message : "Unknown error"}`, "error");
     showEmpty("连接失败", "当前直播无法建立播放连接，请稍后重试。");
+    resumeIdlePolling();
+  } finally {
+    state.viewerConnectingLiveSessionId = null;
   }
 }
 
 async function refreshLiveState() {
+  if (state.refreshInFlight) return;
+  state.refreshInFlight = true;
   try {
     const result = await api.getCurrentLive();
     state.activeLive = result.live ?? null;
@@ -360,9 +417,12 @@ async function refreshLiveState() {
       cleanupViewerState();
       showEmpty("当前未开播", "主播开始投屏后，这个页面会自动播放直播。");
       setStatus("当前未检测到直播。", "idle");
+      resumeIdlePolling();
     }
   } catch (error) {
     console.warn("refreshLiveState failed", error);
+  } finally {
+    state.refreshInFlight = false;
   }
 }
 
@@ -372,7 +432,7 @@ function startPolling() {
     if (state.role !== "host") {
       void refreshLiveState();
     }
-  }, 5000);
+  }, state.pollIntervalMs);
 }
 
 els.startBtn.addEventListener("click", () => void startHostShare());
