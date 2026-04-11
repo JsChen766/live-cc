@@ -95,8 +95,7 @@ const els = {
   resolutionSelect: document.getElementById("resolution-select"),
   fpsSelect: document.getElementById("fps-select"),
   audioToggle: document.getElementById("audio-toggle"),
-  volumeRange: document.getElementById("volume-range"),
-  qualitySelect: document.getElementById("quality-select")
+  volumeRange: document.getElementById("volume-range")
 };
 
 const player = new Plyr(els.mainVideo, {
@@ -135,6 +134,8 @@ const state = {
     sendStable: true,
     sourceFps: null,
     sentFps: null,
+    senderQualityLevel: null,
+    senderQualityMaxBitrate: null,
     smoothBufferMode: "light",
     smoothBufferSupported: false,
     smoothBufferAppliedMs: null,
@@ -586,10 +587,6 @@ els.volumeRange.addEventListener("input", () => {
   player.muted = nextVolume === 0;
   syncMuteUi();
 });
-els.qualitySelect.addEventListener("change", () => {
-  setStatus(`播放器清晰度标记已切换到 ${els.qualitySelect.value}。`, state.activeLive ? "live" : "idle");
-});
-
 window.addEventListener("beforeunload", () => {
   if (state.role === "host") {
     sendStopLiveBeacon(els.hostToken.value.trim());

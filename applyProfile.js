@@ -5,7 +5,7 @@
  */
 
 /**
- * @typedef {"HD_30" | "SD_60" | "HD_60" | "SD_30"} StreamProfile
+ * @typedef {"HD_30" | "SD_30"} StreamProfile
  */
 
 /**
@@ -37,28 +37,6 @@ export const STREAM_PROFILES = {
     scaleResolutionDownBy: 1,
     label: "720p 30fps"
   },
-  SD_60: {
-    profile: "SD_60",
-    width: 960,
-    height: 540,
-    frameRate: 60,
-    contentHint: "motion",
-    minBitrate: 1_800_000,
-    maxBitrate: 2_800_000,
-    scaleResolutionDownBy: 1.33,
-    label: "540p 60fps"
-  },
-  HD_60: {
-    profile: "HD_60",
-    width: 1280,
-    height: 720,
-    frameRate: 60,
-    contentHint: "motion",
-    minBitrate: 3_000_000,
-    maxBitrate: 4_500_000,
-    scaleResolutionDownBy: 1,
-    label: "720p 60fps"
-  },
   SD_30: {
     profile: "SD_30",
     width: 960,
@@ -76,7 +54,7 @@ export function getInitialDisplayVideoConstraints() {
   return {
     width: { ideal: 1280, max: 1280 },
     height: { ideal: 720, max: 720 },
-    frameRate: { ideal: 30, max: 60 }
+    frameRate: { ideal: 30, max: 30 }
   };
 }
 
@@ -146,8 +124,12 @@ async function trySetSenderParameters(sender, profile, logger) {
  * default; instead, it returns a structured result so the live session can
  * continue using the current track settings.
  */
-export async function applyProfile({ profile, videoTrack, videoSender, logger = console }) {
-  const nextProfile = getProfileConfig(profile);
+export async function applyProfile({ profile, videoTrack, videoSender, logger = console, maxBitrateOverride = null }) {
+  const baseProfile = getProfileConfig(profile);
+  const nextProfile =
+    typeof maxBitrateOverride === "number" && Number.isFinite(maxBitrateOverride)
+      ? { ...baseProfile, maxBitrate: maxBitrateOverride }
+      : baseProfile;
   const previousHint = "contentHint" in videoTrack ? videoTrack.contentHint : "";
   let senderRollback = null;
 

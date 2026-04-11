@@ -1,20 +1,33 @@
 /**
  * NON-INTRUSIVE PATCH
- * Stable-first sender control for game screen sharing. This controller only
- * observes WebRTC stats and gently updates sender encodings; it never owns the
- * Cloudflare Realtime publish/subscribe flow.
+ * Stable-first sender clarity control for game screen sharing. This controller
+ * only observes WebRTC stats and gently updates RTCRtpSender encodings; it does
+ * not own or modify the Cloudflare Realtime publish/subscribe flow.
  */
 
 import { applyProfile, DEFAULT_START_PROFILE, getProfileConfig } from "./applyProfile.js";
+import {
+  DEFAULT_SENDER_QUALITY_INDEX,
+  getNextHigherQualityIndex,
+  getNextLowerQualityIndex,
+  getSenderQualityBudget,
+  MIN_SENDER_QUALITY_INDEX
+} from "./senderQualityBudget.js";
 import { WebRtcStatsCollector } from "./webrtcStats.js";
 
 const SAMPLE_INTERVAL_MS = 1000;
+const STARTUP_STABLE_GUARD_MS = 10000;
 const SWITCH_COOLDOWN_MS = 8000;
-const SOURCE_UNSTABLE_UPGRADE_BAN_MS = 20000;
-const UPGRADE_COOLDOWN_MS = 10000;
+const UPGRADE_WINDOW_SIZE = 8;
+const DOWNGRADE_WINDOW_SIZE = 3;
+const RECOVERY_WINDOW_SIZE = 12;
 const LOG_THROTTLE_MS = 4000;
-const HIGH_RTT_MS = 260;
-const LOW_BITRATE_KBPS = 700;
+const RTT_NORMAL_MS = 140;
+const RTT_HIGH_MS = 240;
+const RTT_SEVERE_MS = 320;
+const LOW_BITRATE_KBPS = 500;
+const AVAILABLE_BITRATE_MARGIN = 1.25;
+const RETRANSMIT_WARN_KBPS = 180;
 
 function avg(values) {
   const valid = values.filter((value) => typeof value === "number" && Number.isFinite(value));
@@ -30,24 +43,49 @@ function avgField(samples, field, size) {
   return avg(tail(samples, size).map((sample) => sample[field]));
 }
 
-function countBelow(samples, field, threshold, size) {
-  return tail(samples, size).filter((sample) => typeof sample[field] === "number" && sample[field] < threshold).length;
-}
-
-function hasLimitation(samples, reason, size) {
+function hasReason(samples, reason, size) {
   return tail(samples, size).some((sample) => sample.qualityLimitationReason === reason);
 }
 
-function stableNoLimitation(samples, size) {
-  const items = tail(samples, size);
-  return items.length === size && items.every((sample) => !["cpu", "bandwidth"].includes(sample.qualityLimitationReason));
+function hasBadQualityLimitation(samples, size) {
+  return tail(samples, size).some((sample) => ["cpu", "bandwidth"].includes(sample.qualityLimitationReason));
 }
 
-function nextUpgradeProfile(profile) {
-  if (profile === "SD_30") return "HD_30";
-  if (profile === "HD_30") return "SD_60";
-  if (profile === "SD_60") return "HD_60";
-  return null;
+function mostlyNoQualityLimitation(samples, size) {
+  const items = tail(samples, size);
+  if (items.length < size) return false;
+  const badCount = items.filter((sample) => ["cpu", "bandwidth"].includes(sample.qualityLimitationReason)).length;
+  const noneCount = items.filter((sample) => sample.qualityLimitationReason === "none").length;
+  const unknownCount = items.filter((sample) => sample.qualityLimitationReason === "unknown").length;
+  return badCount === 0 && (noneCount >= Math.ceil(size * 0.6) || noneCount + unknownCount === size);
+}
+
+function hasPacketDiscardWorsening(samples, size) {
+  return tail(samples, size).some((sample) => (sample.packetsDiscardedOnSendDelta ?? 0) > 0);
+}
+
+function hasRetransmitWorsening(samples, size) {
+  return tail(samples, size).some((sample) => (sample.retransmittedBitrateKbps ?? 0) > RETRANSMIT_WARN_KBPS);
+}
+
+function isAvailableBitrateEnough(samples, size, budget) {
+  const avgAvailable = avgField(samples, "availableOutgoingBitrateKbps", size);
+  if (avgAvailable === null) return true;
+  const requiredKbps = Math.max(budget.minAvailableOutgoingBitrateKbps, (budget.maxBitrate / 1000) * AVAILABLE_BITRATE_MARGIN);
+  return avgAvailable >= requiredKbps;
+}
+
+function isAvailableBitrateDropping(samples) {
+  const items = tail(samples, 4);
+  if (items.length < 4) return false;
+  const first = items[0].availableOutgoingBitrateKbps;
+  const last = items[items.length - 1].availableOutgoingBitrateKbps;
+  if (typeof first !== "number" || typeof last !== "number") return false;
+  return last < first * 0.68;
+}
+
+function profileForDebug(profile, qualityBudget) {
+  return `${getProfileConfig(profile).label}/${qualityBudget.id}`;
 }
 
 export class VideoAdaptiveController {
@@ -56,6 +94,7 @@ export class VideoAdaptiveController {
     videoSender,
     videoTrack,
     initialProfile = DEFAULT_START_PROFILE,
+    initialQualityIndex = DEFAULT_SENDER_QUALITY_INDEX,
     logger = console,
     onProfileChanged,
     onUserMessage,
@@ -70,18 +109,20 @@ export class VideoAdaptiveController {
     this.onUserMessage = onUserMessage;
     this.onDebugSample = onDebugSample;
     this.onStateChange = onStateChange;
-    this.currentProfile = initialProfile;
+    this.currentProfile = initialProfile === "SD_30" ? "SD_30" : "HD_30";
+    this.qualityIndex = initialQualityIndex;
     this.samples = [];
     this.timer = null;
+    this.startedAt = 0;
     this.lastSwitchAt = 0;
-    this.upgradeBanUntil = 0;
     this.lastDegradeReason = null;
     this.lastLogAtByKey = new Map();
     this.statsCollector = new WebRtcStatsCollector({ pc, sender: videoSender, videoTrack, logger });
   }
 
   async start() {
-    await this.transitionTo(this.currentProfile, "init", `发送端以 ${getProfileConfig(this.currentProfile).label} 稳定档启动`, true);
+    this.startedAt = Date.now();
+    await this.applyCurrentBudget("init", "发送端以 720p30 稳定档启动，清晰度预算由系统自动寻优", true);
     this.timer = window.setInterval(() => {
       void this.tick();
     }, SAMPLE_INTERVAL_MS);
@@ -96,11 +137,14 @@ export class VideoAdaptiveController {
 
   getState() {
     const last = this.samples[this.samples.length - 1] ?? null;
+    const budget = getSenderQualityBudget(this.qualityIndex);
     return {
       sendProfile: this.currentProfile,
       sendStable: this.isSendStable(),
       sourceFps: last?.sourceFps ?? null,
       sentFps: last?.sentFps ?? null,
+      senderQualityLevel: budget.id,
+      senderQualityMaxBitrate: budget.maxBitrate,
       lastDegradeReason: this.lastDegradeReason
     };
   }
@@ -110,14 +154,14 @@ export class VideoAdaptiveController {
     if (!metrics) return;
 
     this.samples.push(metrics);
-    if (this.samples.length > 12) this.samples.shift();
+    if (this.samples.length > 20) this.samples.shift();
 
     this.emitDebug(metrics);
     this.emitState();
 
     const severe = this.evaluateSevereFallback();
     if (severe) {
-      await this.transitionTo(severe.profile, severe.reason, severe.message, true);
+      await this.transition(severe, true);
       return;
     }
 
@@ -125,193 +169,232 @@ export class VideoAdaptiveController {
     if (!inCooldown) {
       const degrade = this.evaluateDegrade();
       if (degrade) {
-        await this.transitionTo(degrade.profile, degrade.reason, degrade.message, false);
+        await this.transition(degrade, false);
         return;
       }
     }
 
     const upgrade = this.evaluateUpgrade();
     if (upgrade) {
-      await this.transitionTo(upgrade.profile, upgrade.reason, upgrade.message, false);
+      await this.transition(upgrade, false);
     }
   }
 
   evaluateSevereFallback() {
-    const sentAvg3 = avgField(this.samples, "sentFps", 3);
-    const rttAvg3 = avgField(this.samples, "rttMs", 3);
-    const bitrateAvg3 = avgField(this.samples, "bitrateKbps", 3);
+    const sentAvg3 = avgField(this.samples, "sentFps", DOWNGRADE_WINDOW_SIZE);
+    const rttAvg3 = avgField(this.samples, "rttMs", DOWNGRADE_WINDOW_SIZE);
+    const bitrateAvg3 = avgField(this.samples, "bitrateKbps", DOWNGRADE_WINDOW_SIZE);
+
     const severe =
       (typeof sentAvg3 === "number" && sentAvg3 < 20) ||
-      (typeof rttAvg3 === "number" && rttAvg3 > HIGH_RTT_MS) ||
+      (typeof rttAvg3 === "number" && rttAvg3 > RTT_SEVERE_MS) ||
       (typeof bitrateAvg3 === "number" && bitrateAvg3 < LOW_BITRATE_KBPS);
 
-    if (!severe || this.currentProfile === "SD_30") return null;
-    return {
-      profile: "SD_30",
-      reason: "severe-fallback",
-      message: "发送端检测到严重链路异常，已进入 540p30 兜底档"
-    };
-  }
+    if (!severe) return null;
 
-  evaluateDegrade() {
-    const sourceAvg3 = avgField(this.samples, "sourceFps", 3);
-    const sourceAvg5 = avgField(this.samples, "sourceFps", 5);
-    const sentAvg3 = avgField(this.samples, "sentFps", 3);
-
-    const sourceUnstable =
-      (typeof sourceAvg5 === "number" && sourceAvg5 < 28) || countBelow(this.samples, "sourceFps", 25, 3) === 3;
-    if (sourceUnstable) {
-      this.upgradeBanUntil = Date.now() + SOURCE_UNSTABLE_UPGRADE_BAN_MS;
-      if (this.currentProfile !== "HD_30") {
-        return {
-          profile: "HD_30",
-          reason: "source-unstable",
-          message: "发送端采集帧率不足，已回退到 720p30 稳定档"
-        };
-      }
-      return null;
-    }
-
-    if (hasLimitation(this.samples, "bandwidth", 3)) {
-      if (this.currentProfile === "HD_60") {
-        return {
-          profile: "SD_60",
-          reason: "bandwidth",
-          message: "发送端检测到带宽受限，已降为 540p60 保帧率"
-        };
-      }
-      if (this.currentProfile === "HD_30") {
-        return {
-          profile: "SD_30",
-          reason: "bandwidth",
-          message: "发送端检测到带宽受限，已降为 540p30 稳定档"
-        };
-      }
-    }
-
-    if (hasLimitation(this.samples, "cpu", 3)) {
-      if (this.currentProfile === "HD_60") {
-        return {
-          profile: "HD_30",
-          reason: "cpu",
-          message: "发送端检测到 CPU 受限，已回退到 720p30 稳定档"
-        };
-      }
-      if (this.currentProfile === "SD_60") {
-        return {
-          profile: "SD_30",
-          reason: "cpu",
-          message: "发送端检测到 CPU 受限，已回退到 540p30 兜底档"
-        };
-      }
-    }
-
-    const sixtyProfile = this.currentProfile === "HD_60" || this.currentProfile === "SD_60";
-    const sixtyUnstable =
-      sixtyProfile &&
-      ((typeof sentAvg3 === "number" && sentAvg3 < 50) ||
-        (typeof sourceAvg3 === "number" && sourceAvg3 < 55));
-
-    if (!sixtyUnstable) return null;
-
-    if (this.currentProfile === "HD_60") {
+    if (this.currentProfile !== "SD_30") {
       return {
-        profile: "SD_60",
-        reason: "unstable-60",
-        message: "发送端检测到 60fps 不稳定，已降级到 540p60"
+        profile: "SD_30",
+        qualityIndex: MIN_SENDER_QUALITY_INDEX,
+        reason: "severe-fallback",
+        message: "发送端检测到严重不稳定，已回退到 540p30 兜底档"
       };
     }
 
-    return {
-      profile: "HD_30",
-      reason: "unstable-60",
-      message: "发送端检测到 540p60 仍不稳定，已回退到 720p30 稳定档"
-    };
-  }
-
-  evaluateUpgrade() {
-    if (Date.now() - this.lastSwitchAt < UPGRADE_COOLDOWN_MS) return null;
-    if (Date.now() < this.upgradeBanUntil) return null;
-    if (this.samples.length < 10) return null;
-
-    const target = nextUpgradeProfile(this.currentProfile);
-    if (!target) return null;
-
-    const sourceAvg10 = avgField(this.samples, "sourceFps", 10);
-    const sentAvg10 = avgField(this.samples, "sentFps", 10);
-    const rttAvg10 = avgField(this.samples, "rttMs", 10);
-    const noLimit = stableNoLimitation(this.samples, 8);
-    const rttNormal = typeof rttAvg10 !== "number" || rttAvg10 < 140;
-    const sendThreshold = target === "HD_30" ? 28 : 55;
-
-    if (
-      typeof sourceAvg10 === "number" &&
-      sourceAvg10 >= 58 &&
-      typeof sentAvg10 === "number" &&
-      sentAvg10 >= sendThreshold &&
-      noLimit &&
-      rttNormal
-    ) {
+    if (this.qualityIndex !== MIN_SENDER_QUALITY_INDEX) {
+      const nextIndex = getNextLowerQualityIndex(this.qualityIndex);
       return {
-        profile: target,
-        reason: "upgrade-stable",
-        message: `发送端链路恢复稳定，升级到 ${getProfileConfig(target).label}`
+        profile: "SD_30",
+        qualityIndex: nextIndex,
+        reason: "severe-fallback",
+        message: `发送端严重不稳定，已自动降低内部清晰度等级到 ${getSenderQualityBudget(nextIndex).id}`
       };
     }
 
     return null;
   }
 
-  async transitionTo(nextProfile, reason, message, bypassCooldown) {
-    if (!nextProfile) return;
+  evaluateDegrade() {
+    if (this.samples.length < DOWNGRADE_WINDOW_SIZE) return null;
+
+    const sentAvg3 = avgField(this.samples, "sentFps", DOWNGRADE_WINDOW_SIZE);
+    const rttAvg3 = avgField(this.samples, "rttMs", DOWNGRADE_WINDOW_SIZE);
+    const sourceAvg3 = avgField(this.samples, "sourceFps", DOWNGRADE_WINDOW_SIZE);
+    const bandwidthLimited = hasReason(this.samples, "bandwidth", DOWNGRADE_WINDOW_SIZE);
+    const cpuLimited = hasReason(this.samples, "cpu", DOWNGRADE_WINDOW_SIZE);
+    const frameUnstable = typeof sentAvg3 === "number" && sentAvg3 < 28;
+    const sourceUnstable = typeof sourceAvg3 === "number" && sourceAvg3 < 28;
+    const rttHigh = typeof rttAvg3 === "number" && rttAvg3 > RTT_HIGH_MS;
+    const availableDropping = isAvailableBitrateDropping(this.samples);
+    const packetWorsening = hasPacketDiscardWorsening(this.samples, DOWNGRADE_WINDOW_SIZE);
+    const retransmitWorsening = hasRetransmitWorsening(this.samples, DOWNGRADE_WINDOW_SIZE);
+
+    if (!bandwidthLimited && !cpuLimited && !frameUnstable && !sourceUnstable && !rttHigh && !availableDropping && !packetWorsening && !retransmitWorsening) {
+      return null;
+    }
+
+    const reason = bandwidthLimited
+      ? "bandwidth"
+      : cpuLimited
+        ? "cpu"
+        : frameUnstable || sourceUnstable
+          ? "frame-unstable"
+          : rttHigh
+            ? "rtt-high"
+            : availableDropping
+              ? "available-bitrate-drop"
+              : packetWorsening
+                ? "packet-discarded"
+                : "retransmit";
+
+    if (this.qualityIndex > MIN_SENDER_QUALITY_INDEX) {
+      const nextIndex = getNextLowerQualityIndex(this.qualityIndex);
+      const prefix = bandwidthLimited ? "检测到带宽受限" : "检测到发送端开始不稳定";
+      return {
+        profile: this.currentProfile,
+        qualityIndex: nextIndex,
+        reason,
+        message: `${prefix}，已自动降低内部清晰度等级到 ${getSenderQualityBudget(nextIndex).id}`
+      };
+    }
+
+    if (this.currentProfile === "HD_30") {
+      return {
+        profile: "SD_30",
+        qualityIndex: MIN_SENDER_QUALITY_INDEX,
+        reason,
+        message: "在最低清晰度预算下仍不稳定，已从 720p30 回退到 540p30"
+      };
+    }
+
+    return null;
+  }
+
+  evaluateUpgrade() {
+    const now = Date.now();
+    if (now - this.startedAt < STARTUP_STABLE_GUARD_MS) return null;
+    if (now - this.lastSwitchAt < SWITCH_COOLDOWN_MS) return null;
+
+    if (this.currentProfile === "SD_30") {
+      if (!this.isStableFor(RECOVERY_WINDOW_SIZE, getSenderQualityBudget(MIN_SENDER_QUALITY_INDEX))) return null;
+      return {
+        profile: "HD_30",
+        qualityIndex: MIN_SENDER_QUALITY_INDEX,
+        reason: "recover-resolution",
+        message: "链路持续稳定，已从 540p30 恢复到 720p30 最低清晰度预算"
+      };
+    }
+
+    const nextIndex = getNextHigherQualityIndex(this.qualityIndex);
+    if (nextIndex === this.qualityIndex) return null;
+    const nextBudget = getSenderQualityBudget(nextIndex);
+
+    if (!this.isStableFor(UPGRADE_WINDOW_SIZE, nextBudget)) return null;
+
+    return {
+      profile: "HD_30",
+      qualityIndex: nextIndex,
+      reason: "upgrade-quality-budget",
+      message: `链路稳定，已自动提升内部清晰度等级到 ${nextBudget.id}`
+    };
+  }
+
+  isStableFor(size, targetBudget) {
+    if (this.samples.length < size) return false;
+
+    const sourceAvg = avgField(this.samples, "sourceFps", size);
+    const sentAvg = avgField(this.samples, "sentFps", size);
+    const rttAvg = avgField(this.samples, "rttMs", size);
+
+    const fpsStable =
+      (sourceAvg === null || sourceAvg >= 29) &&
+      (sentAvg === null || sentAvg >= 29);
+    const rttStable = rttAvg === null || rttAvg < RTT_NORMAL_MS;
+
+    return (
+      fpsStable &&
+      rttStable &&
+      mostlyNoQualityLimitation(this.samples, size) &&
+      isAvailableBitrateEnough(this.samples, size, targetBudget) &&
+      !hasPacketDiscardWorsening(this.samples, size) &&
+      !hasRetransmitWorsening(this.samples, size) &&
+      !hasBadQualityLimitation(this.samples, size)
+    );
+  }
+
+  async transition(action, bypassCooldown) {
+    if (!action) return;
     if (!bypassCooldown && Date.now() - this.lastSwitchAt < SWITCH_COOLDOWN_MS) return;
 
     const previousProfile = this.currentProfile;
+    const previousQualityIndex = this.qualityIndex;
+    this.currentProfile = action.profile;
+    this.qualityIndex = action.qualityIndex;
+
+    const result = await this.applyCurrentBudget(action.reason, action.message, false, previousProfile);
+    if (!result.ok) {
+      this.currentProfile = previousProfile;
+      this.qualityIndex = previousQualityIndex;
+      this.throttledLog(
+        `transition-failed:${action.reason}`,
+        "warn",
+        "发送端自动清晰度调整失败，已保持原直播参数继续推流"
+      );
+    }
+  }
+
+  async applyCurrentBudget(reason, message, isInitial, previousProfile = this.currentProfile) {
+    const budget = getSenderQualityBudget(this.qualityIndex);
     const result = await applyProfile({
-      profile: nextProfile,
+      profile: this.currentProfile,
       videoTrack: this.videoTrack,
       videoSender: this.videoSender,
-      logger: this.logger
+      logger: this.logger,
+      maxBitrateOverride: budget.maxBitrate
     });
 
-    if (!result.ok) {
-      this.throttledLog(`transition-failed:${nextProfile}`, "warn", `发送端切档失败，保持 ${getProfileConfig(previousProfile).label}`);
-      return;
-    }
+    if (!result.ok) return result;
 
-    this.currentProfile = nextProfile;
     this.lastSwitchAt = Date.now();
-    this.lastDegradeReason = reason === "upgrade-stable" || reason === "init" ? null : reason;
+    this.lastDegradeReason = reason.startsWith("upgrade") || reason.startsWith("recover") || reason === "init" ? null : reason;
     this.onProfileChanged?.({
       reason,
-      profile: nextProfile,
+      profile: this.currentProfile,
       previousProfile,
-      profileLabel: getProfileConfig(nextProfile).label,
+      profileLabel: getProfileConfig(this.currentProfile).label,
+      qualityLevel: budget.id,
+      maxBitrate: budget.maxBitrate,
       trackSettings: this.videoTrack.getSettings?.() ?? null
     });
-    this.throttledLog(`transition:${reason}:${nextProfile}`, "info", message);
-    this.onUserMessage?.(message);
+    this.throttledLog(`sender-budget:${reason}:${this.currentProfile}:${budget.id}`, "info", message);
+    if (isInitial || previousProfile !== this.currentProfile) {
+      this.onUserMessage?.(message);
+    }
     this.emitState();
+    return result;
   }
 
   isSendStable() {
-    const sourceAvg3 = avgField(this.samples, "sourceFps", 3);
-    const sentAvg3 = avgField(this.samples, "sentFps", 3);
+    const sourceAvg3 = avgField(this.samples, "sourceFps", DOWNGRADE_WINDOW_SIZE);
+    const sentAvg3 = avgField(this.samples, "sentFps", DOWNGRADE_WINDOW_SIZE);
     if (sourceAvg3 === null || sentAvg3 === null) return true;
-    return sourceAvg3 >= 28 && sentAvg3 >= (this.currentProfile.endsWith("_60") ? 50 : 25);
+    return sourceAvg3 >= 28 && sentAvg3 >= 28 && !hasBadQualityLimitation(this.samples, DOWNGRADE_WINDOW_SIZE);
   }
 
   emitDebug(metrics) {
+    const budget = getSenderQualityBudget(this.qualityIndex);
     const payload = {
       layer: "sender",
       profile: this.currentProfile,
+      profileLabel: profileForDebug(this.currentProfile, budget),
       sourceFps: metrics.sourceFps,
       sentFps: metrics.sentFps,
       bitrateKbps: metrics.bitrateKbps,
+      availableOutgoingBitrateKbps: metrics.availableOutgoingBitrateKbps,
       rttMs: metrics.rttMs,
       qualityLimitationReason: metrics.qualityLimitationReason
     };
-    this.logger.debug?.("[SenderAdaptive]", payload);
+    this.logger.debug?.("[SenderAutoClarity]", payload);
     this.onDebugSample?.(payload);
   }
 
