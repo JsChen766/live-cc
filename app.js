@@ -129,7 +129,17 @@ const state = {
   viewerLiveSessionId: null,
   viewerConnectingLiveSessionId: null,
   viewerPlaybackController: null,
-  smoothBufferMode: "off",
+  smoothBufferMode: "light",
+  stabilityState: {
+    sendProfile: "HD_30",
+    sendStable: true,
+    sourceFps: null,
+    sentFps: null,
+    smoothBufferMode: "light",
+    smoothBufferSupported: false,
+    smoothBufferAppliedMs: null,
+    lastDegradeReason: null
+  },
   activeLive: null,
   pollTimer: null,
   pollIntervalMs: IDLE_POLL_MS,
@@ -251,6 +261,7 @@ function cleanupViewerState() {
 
 function setSmoothBufferMode(mode) {
   state.smoothBufferMode = mode;
+  state.stabilityState.smoothBufferMode = mode;
   return state.viewerPlaybackController?.setSmoothBufferMode(mode) ?? {
     enabled: mode !== "off",
     mode,
@@ -271,6 +282,11 @@ window.liveccSmoothPlayback = {
       lastError: "receiver-unavailable"
     },
   getOptions: () => state.viewerPlaybackController?.getModeOptions() ?? getSmoothBufferModeOptions()
+};
+
+window.liveccStability = {
+  getState: () => ({ ...state.stabilityState }),
+  setSmoothBufferMode
 };
 
 async function stopLive() {
@@ -386,6 +402,12 @@ async function startHostShare() {
           videoTrack,
           initialProfile: DEFAULT_START_PROFILE,
           onUserMessage: (message) => setStatus(message, "live"),
+          onStateChange: (senderState) => {
+            state.stabilityState = {
+              ...state.stabilityState,
+              ...senderState
+            };
+          },
           onProfileChanged: ({ profileLabel }) => {
             setStatus(`直播已启动，自适应推流当前档位 ${profileLabel}。`, "live");
           }
@@ -425,6 +447,9 @@ async function startViewerPlayback(liveState) {
     state.viewerPlaybackController = new RemotePlaybackController({
       mode: state.smoothBufferMode,
       onStateChange: (smoothState) => {
+        state.stabilityState.smoothBufferMode = smoothState.mode;
+        state.stabilityState.smoothBufferSupported = smoothState.supported;
+        state.stabilityState.smoothBufferAppliedMs = smoothState.appliedMs;
         console.debug("[SmoothBuffer] state", smoothState);
       }
     });

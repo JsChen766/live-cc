@@ -17,6 +17,7 @@
  *   contentHint: "detail" | "motion" | "text";
  *   maxBitrate: number;
  *   minBitrate: number;
+ *   scaleResolutionDownBy: number;
  *   label: string;
  * }} StreamProfileConfig
  */
@@ -30,9 +31,10 @@ export const STREAM_PROFILES = {
     width: 1280,
     height: 720,
     frameRate: 30,
-    contentHint: "detail",
+    contentHint: "motion",
     minBitrate: 1_800_000,
     maxBitrate: 2_500_000,
+    scaleResolutionDownBy: 1,
     label: "720p 30fps"
   },
   SD_60: {
@@ -43,6 +45,7 @@ export const STREAM_PROFILES = {
     contentHint: "motion",
     minBitrate: 1_800_000,
     maxBitrate: 2_800_000,
+    scaleResolutionDownBy: 1.33,
     label: "540p 60fps"
   },
   HD_60: {
@@ -53,6 +56,7 @@ export const STREAM_PROFILES = {
     contentHint: "motion",
     minBitrate: 3_000_000,
     maxBitrate: 4_500_000,
+    scaleResolutionDownBy: 1,
     label: "720p 60fps"
   },
   SD_30: {
@@ -60,9 +64,10 @@ export const STREAM_PROFILES = {
     width: 960,
     height: 540,
     frameRate: 30,
-    contentHint: "detail",
+    contentHint: "motion",
     minBitrate: 900_000,
     maxBitrate: 1_500_000,
+    scaleResolutionDownBy: 1.33,
     label: "540p 30fps"
   }
 };
@@ -81,30 +86,6 @@ export function getProfileConfig(profile) {
 
 export function getContentHintForProfile(profile) {
   return getProfileConfig(profile).contentHint;
-}
-
-function buildConstraintsFromProfile(profile) {
-  const config = getProfileConfig(profile);
-  return {
-    width: { ideal: config.width, max: config.width },
-    height: { ideal: config.height, max: config.height },
-    frameRate: { ideal: config.frameRate, max: config.frameRate }
-  };
-}
-
-function buildRollbackConstraints(track) {
-  const settings = track.getSettings?.() ?? {};
-  const rollback = {};
-  if (typeof settings.width === "number" && settings.width > 0) {
-    rollback.width = { ideal: settings.width, max: settings.width };
-  }
-  if (typeof settings.height === "number" && settings.height > 0) {
-    rollback.height = { ideal: settings.height, max: settings.height };
-  }
-  if (typeof settings.frameRate === "number" && settings.frameRate > 0) {
-    rollback.frameRate = { ideal: settings.frameRate, max: Math.max(settings.frameRate, 60) };
-  }
-  return rollback;
 }
 
 async function trySetContentHint(track, hint, logger) {
@@ -131,11 +112,19 @@ async function trySetSenderParameters(sender, profile, logger) {
             return {
               ...encoding,
               maxBitrate: profile.maxBitrate,
-              maxFramerate: profile.frameRate
+              maxFramerate: profile.frameRate,
+              scaleResolutionDownBy: profile.scaleResolutionDownBy
             };
           })
-        : [{ maxBitrate: profile.maxBitrate, maxFramerate: profile.frameRate }]
+        : [
+            {
+              maxBitrate: profile.maxBitrate,
+              maxFramerate: profile.frameRate,
+              scaleResolutionDownBy: profile.scaleResolutionDownBy
+            }
+          ]
     };
+    nextParameters.degradationPreference = "maintain-framerate";
 
     await sender.setParameters(nextParameters);
     return {
@@ -159,17 +148,22 @@ async function trySetSenderParameters(sender, profile, logger) {
  */
 export async function applyProfile({ profile, videoTrack, videoSender, logger = console }) {
   const nextProfile = getProfileConfig(profile);
-  const rollbackConstraints = buildRollbackConstraints(videoTrack);
   const previousHint = "contentHint" in videoTrack ? videoTrack.contentHint : "";
   let senderRollback = null;
 
   try {
-    await videoTrack.applyConstraints(buildConstraintsFromProfile(profile));
     await trySetContentHint(videoTrack, getContentHintForProfile(profile), logger);
 
     if (videoSender) {
       const senderResult = await trySetSenderParameters(videoSender, nextProfile, logger);
       senderRollback = senderResult.rollback;
+      if (!senderResult.ok) {
+        return {
+          ok: false,
+          profile,
+          error: new Error("sender-parameters-failed")
+        };
+      }
     }
 
     return {
@@ -181,19 +175,11 @@ export async function applyProfile({ profile, videoTrack, videoSender, logger = 
     logger?.warn?.(`applyProfile: failed to apply ${profile}`, error);
 
     try {
-      if (Object.keys(rollbackConstraints).length > 0) {
-        await videoTrack.applyConstraints(rollbackConstraints);
-      }
-    } catch (rollbackError) {
-      logger?.warn?.("applyProfile: rollback constraints failed", rollbackError);
-    }
-
-    if ("contentHint" in videoTrack) {
-      try {
+      if ("contentHint" in videoTrack) {
         videoTrack.contentHint = previousHint;
-      } catch (hintError) {
-        logger?.warn?.("applyProfile: rollback contentHint failed", hintError);
       }
+    } catch (hintError) {
+      logger?.warn?.("applyProfile: rollback contentHint failed", hintError);
     }
 
     if (senderRollback) {
