@@ -32,7 +32,7 @@ export async function onRequest(context) {
   }
 
   const expectedToken = context.env.HOST_TOKEN;
-  const providedToken = context.request.headers.get("x-host-token") ?? "";
+  const providedToken = context.request.headers.get("x-host-token") ?? (await context.request.json().catch(() => null))?.hostToken ?? "";
   if (expectedToken && providedToken !== expectedToken) {
     return fail("Host token is invalid.", 403);
   }

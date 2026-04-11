@@ -120,6 +120,7 @@ const state = {
   hostLocalStream: null,
   hostPublishedTracks: [],
   hostAdaptiveController: null,
+  hostStopping: false,
   viewerPc: null,
   viewerRemoteStream: null,
   viewerSessionId: null,
@@ -167,6 +168,22 @@ function resumeIdlePolling() {
 
 function useLivePolling() {
   setPollingInterval(LIVE_POLL_MS);
+}
+
+function isTrackNotFoundError(error) {
+  return error instanceof Error && error.message.toLowerCase().includes("track not found");
+}
+
+function sendStopLiveBeacon(hostToken) {
+  const payload = JSON.stringify(hostToken ? { hostToken } : {});
+  const blob = new Blob([payload], { type: "application/json" });
+  navigator.sendBeacon("/api/live/stop", blob);
+}
+
+function requestHostStop(reason) {
+  if (state.role !== "host" || state.hostStopping || !state.hostSessionId) return;
+  console.warn(reason);
+  void stopLive();
 }
 
 function createRealtimePeerConnection() {
@@ -227,6 +244,8 @@ function cleanupViewerState() {
 }
 
 async function stopLive() {
+  if (state.hostStopping) return;
+  state.hostStopping = true;
   const hostToken = els.hostToken.value.trim();
   setStatus("正在停止直播...", "loading");
   try {
@@ -236,6 +255,7 @@ async function stopLive() {
   }
   await cleanupHostState();
   state.activeLive = null;
+  state.hostStopping = false;
   setButtons(false);
   showEmpty("当前未开播", "主播开始投屏后，这个页面会自动播放直播。");
   setStatus("直播已停止。", "idle");
@@ -266,6 +286,11 @@ async function startHostShare() {
 
     const pc = createRealtimePeerConnection();
     state.hostPc = pc;
+    pc.addEventListener("connectionstatechange", () => {
+      if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+        requestHostStop(`host peer connection ${pc.connectionState}, clearing live state`);
+      }
+    });
 
     const transceivers = localStream.getTracks().map((track) =>
       pc.addTransceiver(track, {
@@ -274,6 +299,13 @@ async function startHostShare() {
     );
     const videoTrack = localStream.getVideoTracks()[0] ?? null;
     const videoTransceiver = transceivers.find((transceiver) => transceiver.sender.track?.kind === "video") ?? null;
+    videoTrack?.addEventListener(
+      "ended",
+      () => {
+        requestHostStop("screen share track ended, clearing live state");
+      },
+      { once: true }
+    );
 
     setStatus("正在创建 Realtime Session...", "loading");
     await pc.setLocalDescription(await pc.createOffer());
@@ -424,8 +456,14 @@ async function startViewerPlayback(liveState) {
   } catch (error) {
     console.error(error);
     cleanupViewerState();
-    setStatus(`观看失败：${error instanceof Error ? error.message : "Unknown error"}`, "error");
-    showEmpty("连接失败", "当前直播无法建立播放连接，请稍后重试。");
+    if (isTrackNotFoundError(error)) {
+      state.activeLive = null;
+      setStatus("直播状态已过期，正在等待主播重新开播。", "idle");
+      showEmpty("直播已结束或已刷新", "检测到旧的直播轨道已失效，页面会继续自动等待新的直播。");
+    } else {
+      setStatus(`观看失败：${error instanceof Error ? error.message : "Unknown error"}`, "error");
+      showEmpty("连接失败", "当前直播无法建立播放连接，请稍后重试。");
+    }
     resumeIdlePolling();
   } finally {
     state.viewerConnectingLiveSessionId = null;
@@ -489,7 +527,7 @@ els.qualitySelect.addEventListener("change", () => {
 
 window.addEventListener("beforeunload", () => {
   if (state.role === "host") {
-    navigator.sendBeacon("/api/live/stop");
+    sendStopLiveBeacon(els.hostToken.value.trim());
   }
 });
 
