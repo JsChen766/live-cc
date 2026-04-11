@@ -1,4 +1,6 @@
 import { DEFAULT_START_PROFILE, getInitialDisplayVideoConstraints, getProfileConfig } from "./applyProfile.js";
+import { getSmoothBufferModeOptions } from "./receiverSmoothBuffer.js";
+import { RemotePlaybackController } from "./remotePlaybackController.js";
 import { VideoAdaptiveController } from "./videoAdaptiveController.js";
 
 class RealtimeApiClient {
@@ -126,6 +128,8 @@ const state = {
   viewerSessionId: null,
   viewerLiveSessionId: null,
   viewerConnectingLiveSessionId: null,
+  viewerPlaybackController: null,
+  smoothBufferMode: "off",
   activeLive: null,
   pollTimer: null,
   pollIntervalMs: IDLE_POLL_MS,
@@ -237,11 +241,37 @@ function cleanupViewerState() {
   state.viewerSessionId = null;
   state.viewerLiveSessionId = null;
   state.viewerConnectingLiveSessionId = null;
+  state.viewerPlaybackController?.stop();
+  state.viewerPlaybackController = null;
   if (state.viewerRemoteStream) {
     state.viewerRemoteStream.getTracks().forEach((track) => track.stop());
     state.viewerRemoteStream = null;
   }
 }
+
+function setSmoothBufferMode(mode) {
+  state.smoothBufferMode = mode;
+  return state.viewerPlaybackController?.setSmoothBufferMode(mode) ?? {
+    enabled: mode !== "off",
+    mode,
+    supported: false,
+    appliedMs: null,
+    lastError: "receiver-unavailable"
+  };
+}
+
+window.liveccSmoothPlayback = {
+  setMode: setSmoothBufferMode,
+  getState: () =>
+    state.viewerPlaybackController?.getState() ?? {
+      enabled: state.smoothBufferMode !== "off",
+      mode: state.smoothBufferMode,
+      supported: false,
+      appliedMs: null,
+      lastError: "receiver-unavailable"
+    },
+  getOptions: () => state.viewerPlaybackController?.getModeOptions() ?? getSmoothBufferModeOptions()
+};
 
 async function stopLive() {
   if (state.hostStopping) return;
@@ -391,6 +421,13 @@ async function startViewerPlayback(liveState) {
     state.viewerPc = pc;
     const remoteStream = new MediaStream();
     state.viewerRemoteStream = remoteStream;
+    // NON-INTRUSIVE PATCH / RECEIVER-SIDE ONLY: optional smooth playback buffer, default off.
+    state.viewerPlaybackController = new RemotePlaybackController({
+      mode: state.smoothBufferMode,
+      onStateChange: (smoothState) => {
+        console.debug("[SmoothBuffer] state", smoothState);
+      }
+    });
     let recovering = false;
 
     const recoverViewerPlayback = () => {
@@ -416,6 +453,9 @@ async function startViewerPlayback(liveState) {
     });
 
     pc.ontrack = (event) => {
+      if (event.track.kind === "video") {
+        state.viewerPlaybackController?.attachReceiver(event.receiver);
+      }
       if (event.streams[0]) {
         event.streams[0].getTracks().forEach((track) => {
           if (!remoteStream.getTracks().some((existing) => existing.id === track.id)) {
